@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"io/ioutil"
 	"math/rand"
 	nethttp "net/http"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/influxdata/flux"
+	"github.com/influxdata/flux/csv"
 	"github.com/influxdata/flux/execute"
 	"github.com/influxdata/flux/execute/executetest"
 	"github.com/influxdata/flux/lang"
@@ -25,6 +27,7 @@ import (
 	phttp "github.com/influxdata/influxdb/v2/http"
 	"github.com/influxdata/influxdb/v2/kit/prom"
 	"github.com/influxdata/influxdb/v2/query"
+	dto "github.com/prometheus/client_model/go"
 )
 
 func TestLauncher_Write_Query_FieldKey(t *testing.T) {
@@ -743,5 +746,81 @@ from(bucket: "%s")
 	// Make sure that the data we stored matches the CSV
 	if err := executetest.EqualResultIterators(csvResultIterator, fromResultIterator); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLauncher_Query_PushDownWindowAggregateCount(t *testing.T) {
+	l := launcher.RunTestLauncherOrFail(t, ctx, "--feature-flags", "pushDownWindowAggregateCount=true")
+	l.SetupOrFail(t)
+	defer l.ShutdownOrFail(t, ctx)
+
+	l.WritePointsOrFail(t, `
+m0,k=k0 f=0i 0
+m0,k=k0 f=1i 1000000000
+m0,k=k0 f=2i 2000000000
+m0,k=k0 f=3i 3000000000
+m0,k=k0 f=4i 4000000000
+m0,k=k0 f=5i 5000000000
+m0,k=k0 f=6i 6000000000
+m0,k=k0 f=5i 7000000000
+m0,k=k0 f=0i 8000000000
+m0,k=k0 f=6i 9000000000
+m0,k=k0 f=6i 10000000000
+m0,k=k0 f=7i 11000000000
+m0,k=k0 f=5i 12000000000
+m0,k=k0 f=8i 13000000000
+m0,k=k0 f=9i 14000000000
+m0,k=k0 f=5i 15000000000
+`)
+
+	query := fmt.Sprintf(`
+from(bucket: "%s")
+	|> range(start: 1970-01-01T00:00:00Z, stop: 1970-01-01T00:00:15Z)
+	|> aggregateWindow(every: 5s, fn: count)
+	|> drop(columns: ["_start", "_stop"])
+`, l.Bucket.Name)
+	res := l.MustExecuteQuery(query)
+	defer res.Done()
+	got := flux.NewSliceResultIterator(res.Results)
+	defer got.Release()
+
+	dec := csv.NewMultiResultDecoder(csv.ResultDecoderConfig{})
+	data := `
+#datatype,string,long,long,string,string,string,dateTime:RFC3339
+#group,false,false,false,true,true,true,false
+#default,_result,,,,,,
+,result,table,_value,_field,_measurement,k,_time
+,,0,5,f,m0,k0,1970-01-01T00:00:05Z
+,,0,5,f,m0,k0,1970-01-01T00:00:10Z
+,,0,5,f,m0,k0,1970-01-01T00:00:15Z
+`
+	want, err := dec.Decode(ioutil.NopCloser(strings.NewReader(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer want.Release()
+
+	if err := executetest.EqualResultIterators(want, got); err != nil {
+		t.Fatal(err)
+	}
+
+	h, ok := func() (*dto.Histogram, bool) {
+		const metricName = "query_influxdb_source_read_request_duration_seconds"
+		mf := l.Metrics(t)[metricName]
+		for _, m := range mf.Metric {
+			for _, label := range m.Label {
+				if label.GetName() == "op" && label.GetValue() == "readWindowAggregate" {
+					return m.GetHistogram(), true
+				}
+			}
+		}
+		return nil, false
+	}()
+	if !ok {
+		t.Fatal("no metric found for readWindowAggregate operation")
+	}
+
+	if want, got := uint64(1), h.GetSampleCount(); want != got {
+		t.Fatalf("unexpected sample count -want/+got:\n\t- %d\n\t+ %d", want, got)
 	}
 }
